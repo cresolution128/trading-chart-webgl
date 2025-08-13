@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Live WebGL Line Chart with Gradient Fill</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html,body { height:100%; margin:0; display:flex; align-items:center; justify-content:center; background:#0b1220; color:#fff; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; }
+    #container { width:90vw; max-width:1000px; height:60vh; max-height:600px; position:relative; }
+    canvas { width:100%; height:100%; display:block; background:linear-gradient(#07101a,#07101a); border-radius:8px; }
+    .controls { position:absolute; left:10px; top:10px; display:flex; gap:8px; }
+    button { background:#0d6efd; color:white; border:none; padding:6px 10px; border-radius:6px; cursor:pointer; }
+    label { font-size:13px; color:#cfe8ff; display:flex; align-items:center; gap:6px; }
+    input[type=range] { width:160px; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <canvas id="gl" ></canvas>
+    <div class="controls">
+       <button id="pauseBtn">Pause</button>
+       <button id="showWireframeBtn">Show Wireframes</button>
+    </div>
+  </div>
+
+<script>
+/*
+  Live WebGL Chart
+  - Uses two GL programs: one for the gradient fill (triangles), one for the outline (line strip).
+  - Data model: fixed number of points (maxPoints). Each update: shift x positions left by dx, drop the leftmost, append a new point at x=1.
+  - Fill vertices: for each segment we construct two triangles (trapezoid) formed by (p1, p2, p1_bottom) and (p1_bottom, p2, p2_bottom).
+*/
+
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl', { antialias: true });
+if (!gl) throw new Error('WebGL not supported');
+
+// Enable necessary WebGL features
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+let devicePixelRatio = window.devicePixelRatio || 1;
+
+function resizeCanvasToDisplaySize() {
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(1, Math.floor(rect.width * devicePixelRatio));
+  const h = Math.max(1, Math.floor(rect.height * devicePixelRatio));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+window.addEventListener('resize', resizeCanvasToDisplaySize);
+resizeCanvasToDisplaySize();
+
+/* ---------- helper: compile/link shaders ---------- */
+function compileShader(src, type) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+function createProgram(vsSrc, fsSrc) {
+  const vs = compileShader(vsSrc, gl.VERTEX_SHADER);
+  const fs = compileShader(fsSrc, gl.FRAGMENT_SHADER);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+/* ---------- Shaders ---------- */
+// Fill (triangles) — vertex passes y to fragment for gradient
+const fillVS = `
+  attribute vec2 aPos;
+  varying float vY;
+  void main() {
+    vY = aPos.y;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`;
+const fillFS = `
+  precision mediump float;
+  varying float vY;
+  uniform vec3 uTopColor;
+  uniform vec3 uBottomColor;
+  void main() {
+    // Map vY (-1..1) to t (0..1)
+    float t = (vY + 1.0) * 0.5;
+    // Smooth the gradient a bit
+    t = smoothstep(0.0, 1.0, t);
+    gl_FragColor = vec4(mix(uBottomColor, uTopColor, t), 1.0);
+  }
+`;
+
+// Line (outline)
+const lineVS = `
+  attribute vec2 aPos;
+  void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`;
+const lineFS = `
+  precision mediump float;
+  uniform vec4 uColor;
+  void main() {
+    gl_FragColor = uColor;
+  }
+`;
+
+/* ---------- Programs and buffers ---------- */
+const fillProgram = createProgram(fillVS, fillFS);
+const fillPosLoc = gl.getAttribLocation(fillProgram, 'aPos');
+const fillTopColorLoc = gl.getUniformLocation(fillProgram, 'uTopColor');
+const fillBottomColorLoc = gl.getUniformLocation(fillProgram, 'uBottomColor');
+const fillBuffer = gl.createBuffer();
+
+const lineProgram = createProgram(lineVS, lineFS);
+const linePosLoc = gl.getAttribLocation(lineProgram, 'aPos');
+const lineColorLoc = gl.getUniformLocation(lineProgram, 'uColor');
+const lineBuffer = gl.createBuffer();
+
+// MSDF Text program for "BTC" - GLSL ES 1.00 compatible
+const textVS = `
+  attribute vec2 aPosition;
+  attribute vec2 aTexCoord;
+  varying vec2 vTexCoord;
+  uniform mat4 uProjection;
+  void main() {
+    vTexCoord = aTexCoord;
+    gl_Position = uProjection * vec4(aPosition, 0.0, 1.0);
+  }
+`;
+
+const textFS = `
+  precision mediump float;
+  varying vec2 vTexCoord;
+  uniform sampler2D uTexture;
+  uniform vec4 uColor;
+  uniform float uPxRange;
+  
+  float median(float r, float g, float b) {
+    return max(min(r, g), min(max(r, g), b));
+  }
+  
+  void main() {
+    vec3 texColor = texture2D(uTexture, vTexCoord).rgb;
+    float sigDist = median(texColor.r, texColor.g, texColor.b) - 0.5;
+    // Simple threshold-based alpha calculation (no fwidth needed)
+    float alpha = smoothstep(-0.1, 0.1, sigDist);
+    gl_FragColor = vec4(uColor.rgb, uColor.a * alpha);
+  }
+`;
+
+const textProgram = createProgram(textVS, textFS);
+const textPosLoc = gl.getAttribLocation(textProgram, 'aPosition');
+const textTexLoc = gl.getAttribLocation(textProgram, 'aTexCoord');
+const textProjLoc = gl.getUniformLocation(textProgram, 'uProjection');
+const textTextureLoc = gl.getUniformLocation(textProgram, 'uTexture');
+const textColorLoc = gl.getUniformLocation(textProgram, 'uColor');
+const textPxRangeLoc = gl.getUniformLocation(textProgram, 'uPxRange');
+
+// Text buffers
+const textPosBuffer = gl.createBuffer();
+const textTexBuffer = gl.createBuffer();
+
+/* ---------- Chart data model ---------- */
+let maxPoints = 50;         // number of samples shown on screen
+let baseline = -1.0;         // baseline y for the fill area (normalized device coords)
+let dx = 2.0 / (maxPoints - 1); // x-step between points in NDC
+let points = [];             // array of {x,y}
+
+function initPoints() {
+  points = [];
+  dx = 2.0 / (maxPoints - 1);
+  for (let i = 0; i < maxPoints; i++) {
+    const x = -1 + i * dx;
+    // initial curve: small wave
+    const y = 0;
+    points.push({ x, y });
+  }
+}
+initPoints();
+
+/* ---------- Bitmap Font Atlas Setup ---------- */
+// Bitmap font atlas data
+let fontAtlas = null;
+let fontTexture = null;
+
+// Load bitmap font atlas data
+async function loadFontAtlas() {
+  try {
+    // Load the JSON file with glyph data
+    const response = await fetch('assets/Roboto-Regular.json');
+    fontAtlas = await response.json();
+    
+    // Load the PNG texture
+    const img = new Image();
+    img.onload = () => {
+      fontTexture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, fontTexture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    };
+    img.src = 'assets/Roboto-Regular.png';
+  } catch (error) {
+    console.error('Failed to load font atlas:', error);
+  }
+}
+
+// Initialize font atlas
+loadFontAtlas();
+
+// Create a simple quad for text rendering
+const textPositions = new Float32Array([
+  0, 0,   // bottom-left
+  1, 0,   // bottom-right
+  0, 1,   // top-left
+  1, 0,   // bottom-right
+  1, 1,   // top-right
+  0, 1    // top-left
+]);
+
+const textTexCoords = new Float32Array([
+  0, 1,   // bottom-left (flipped Y)
+  1, 1,   // bottom-right (flipped Y)
+  0, 0,   // top-left (flipped Y)
+  1, 0,   // bottom-right (flipped Y)
+  1, 0,   // top-right (flipped Y)
+  0, 1    // top-left (flipped Y)
+]);
+
+// Setup text buffers (WebGL 1.0 compatible)
+gl.bindBuffer(gl.ARRAY_BUFFER, textPosBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, textPositions, gl.STATIC_DRAW);
+
+gl.bindBuffer(gl.ARRAY_BUFFER, textTexBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, textTexCoords, gl.STATIC_DRAW);
+
+/* ---------- Bitmap Font Text Rendering Function ---------- */
+function renderMSDFText(text, options = {}) {
+  const {
+    x = 0,           // X position (-1 to 1)
+    y = 0,           // Y position (-1 to 1)
+    scale = 0.2,     // Scale factor
+    color = [1.0, 1.0, 1.0, 1.0], // RGBA color
+          fontSize = 48,   // Font size in pixels (for scaling calculation)
+      letterSpacing = -4 // Letter spacing in pixels (positive = wider, negative = tighter)
+  } = options;
+  
+  // Check if font atlas is loaded
+  if (!fontAtlas || !fontTexture) {
+    console.warn('Font atlas not loaded yet, skipping text render');
+    return;
+  }
+  
+  // Get atlas dimensions
+  const atlasWidth = fontAtlas.common.scaleW;
+  const atlasHeight = fontAtlas.common.scaleH;
+  const baseFontSize = fontAtlas.common.lineHeight;
+  
+  // Calculate total text width in pixels (including letter spacing)
+  let totalTextWidth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    const glyph = fontAtlas.chars.find(g => g.char === char);
+    if (glyph) {
+      totalTextWidth += glyph.xadvance;
+    } else {
+      // Fallback for missing characters
+      totalTextWidth += baseFontSize * 0.6;
+    }
+    // Add letter spacing between characters (but not after the last character)
+    if (i < text.length - 1) {
+      totalTextWidth += letterSpacing;
+    }
+  }
+  
+  // Calculate scale factor based on desired font size
+  const scaleFactor = (fontSize / baseFontSize) * scale;
+  
+  // Calculate the offset to center the text (half width in NDC)
+  const textWidthNDC = (totalTextWidth / 100.0) * scaleFactor;
+  const centerOffsetX = x - (textWidthNDC / 2.0);
+  
+  // Set up projection matrix for text positioning (centered)
+  const textProjection = new Float32Array([
+    scaleFactor, 0, 0, 0,      // Scale X
+    0, scaleFactor, 0, 0,      // Scale Y
+    0, 0, 1, 0,
+    centerOffsetX, y, 0, 1     // Position (centered)
+  ]);
+  
+  // Use text program and set uniforms
+  gl.useProgram(textProgram);
+  gl.uniformMatrix4fv(textProjLoc, false, textProjection);
+  gl.uniform4f(textColorLoc, color[0], color[1], color[2], color[3]);
+  gl.uniform1f(textPxRangeLoc, 4.0); // Standard value for bitmap fonts
+  
+  // Set up font texture
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fontTexture);
+  gl.uniform1i(textTextureLoc, 0);
+  
+  // Set up vertex attributes
+  gl.bindBuffer(gl.ARRAY_BUFFER, textPosBuffer);
+  gl.enableVertexAttribArray(textPosLoc);
+  gl.vertexAttribPointer(textPosLoc, 2, gl.FLOAT, false, 0, 0);
+  
+  gl.bindBuffer(gl.ARRAY_BUFFER, textTexBuffer);
+  gl.enableVertexAttribArray(textTexLoc);
+  gl.vertexAttribPointer(textTexLoc, 2, gl.FLOAT, false, 0, 0);
+  
+  // Render each character
+  let currentX = 0;
+  
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    // Find glyph in the chars array
+    const glyph = fontAtlas.chars.find(g => g.char === char);
+    
+    if (glyph) {
+      // Calculate character position in normalized device coordinates
+      // Convert from pixel coordinates to NDC (-1 to +1)
+      const charX = (currentX + glyph.xoffset) / 100.0;  // Scale down pixel coordinates
+      
+      // Normalize Y position for consistent baseline alignment across all characters
+      let charY;
+      if (char === '.') {
+        // For dots, align to the bottom baseline of numbers
+        charY = (glyph.yoffset + glyph.height * 0.5 - baseFontSize) / 100.0;
+      } else if (char === '-') {
+        // For hyphens, center them vertically with the text baseline
+        charY = (glyph.yoffset + glyph.height * 0.5 - baseFontSize * 0.35) / 100.0;
+      } else {
+        // For all other characters, normalize to a consistent baseline
+        // Use the maximum height as reference and align all characters to the same baseline
+        const normalizedY = (glyph.yoffset + glyph.height - baseFontSize) / 100.0;
+        charY = normalizedY;
+      }
+      
+      // Update texture coordinates for this character
+      const texCoords = new Float32Array([
+        glyph.x / atlasWidth, (glyph.y + glyph.height) / atlasHeight,  // bottom-left
+        (glyph.x + glyph.width) / atlasWidth, (glyph.y + glyph.height) / atlasHeight,  // bottom-right
+        glyph.x / atlasWidth, glyph.y / atlasHeight,  // top-left
+        (glyph.x + glyph.width) / atlasWidth, (glyph.y + glyph.height) / atlasHeight,  // bottom-right
+        (glyph.x + glyph.width) / atlasWidth, glyph.y / atlasHeight,  // top-right
+        glyph.x / atlasWidth, glyph.y / atlasHeight   // top-left
+      ]);
+      
+      // Update texture coordinate buffer
+      gl.bindBuffer(gl.ARRAY_BUFFER, textTexBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, texCoords, gl.DYNAMIC_DRAW);
+      
+      // Update position buffer for this character (in NDC)
+      const charPositions = new Float32Array([
+        charX, charY,                    // bottom-left
+        charX + (glyph.width / 100.0), charY,      // bottom-right
+        charX, charY + (glyph.height / 100.0),     // top-left
+        charX + (glyph.width / 100.0), charY,      // bottom-right
+        charX + (glyph.width / 100.0), charY + (glyph.height / 100.0), // top-right
+        charX, charY + (glyph.height / 100.0)      // top-left
+      ]);
+      
+      gl.bindBuffer(gl.ARRAY_BUFFER, textPosBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, charPositions, gl.DYNAMIC_DRAW);
+      
+      // Draw this character
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      
+      // Move to next character position with letter spacing
+      currentX += glyph.xadvance + letterSpacing;
+    } else {
+      // Fallback for missing characters
+      currentX += fontSize * 0.6;
+    }
+  }
+}
+
+/* ---------- Fill geometry builder ---------- */
+function buildFillVertices() {
+  // returns a Float32Array of 2D vertices (x,y) for triangles
+  const n = points.length;
+  const verts = new Float32Array((n - 1) * 6 * 2); // (n-1) segments * 2 triangles * 3 vertices * 2 components
+  let off = 0;
+  for (let i = 0; i < n - 1; i++) {
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    // Triangle 1: p1, p2, p1_bottom
+    verts[off++] = p1.x; verts[off++] = p1.y;
+    verts[off++] = p2.x; verts[off++] = p2.y;
+    verts[off++] = p1.x; verts[off++] = baseline;
+    // Triangle 2: p1_bottom, p2, p2_bottom
+    verts[off++] = p1.x; verts[off++] = baseline;
+    verts[off++] = p2.x; verts[off++] = p2.y;
+    verts[off++] = p2.x; verts[off++] = baseline;
+  }
+  return verts;
+}
+
+/* ---------- Line geometry builder ---------- */
+function buildLineVertices() {
+  // returns Float32Array of point positions (x,y) for GL.LINE_STRIP
+  const arr = new Float32Array(points.length * 2);
+  let off = 0;
+  for (let i = 0; i < points.length; i++) {
+    arr[off++] = points[i].x;
+    arr[off++] = points[i].y;
+  }
+  return arr;
+}
+
+/* ---------- Update logic (push new sample, scroll left) ---------- */
+function pushNewSample(yValue) {
+  // shift all x left by dx; drop leftmost; append new at x=1
+  for (let i = 0; i < points.length; i++) points[i].x -= dx;
+  points.shift();
+  points.push({ x: 1.0, y: yValue });
+}
+
+ /* ---------- Data source ---------- */
+ let producing = true;
+ let showWireframes = false;
+ let sampleHandle = null;
+ 
+ // Random sample generator every 300ms
+ function generateSample() {
+   // Generate random value between -0.8 and 0.8
+   return (Math.random() * 2 - 1) * 0.5;
+ }
+ 
+ function startProducing() {
+   if (sampleHandle) clearInterval(sampleHandle);
+   sampleHandle = setInterval(() => {
+     if (!producing) return;
+     const y = generateSample();
+     pushNewSample(y);
+   }, 300); // Generate every 300ms
+ }
+ startProducing();
+
+/* ---------- Render ---------- */
+function render() {
+  resizeCanvasToDisplaySize();
+  gl.clearColor(0.95, 0.95, 1.0, 1.0); // #f3f3ff
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+     // 1) Draw fill or wireframes
+   const fillVerts = buildFillVertices();
+   gl.bindBuffer(gl.ARRAY_BUFFER, fillBuffer);
+   gl.bufferData(gl.ARRAY_BUFFER, fillVerts, gl.STREAM_DRAW);
+ 
+   if (showWireframes) {
+     // Draw wireframes
+     gl.useProgram(lineProgram);
+     gl.enableVertexAttribArray(linePosLoc);
+     gl.vertexAttribPointer(linePosLoc, 2, gl.FLOAT, false, 0, 0);
+     gl.uniform4f(lineColorLoc, 1.0, 0.0, 0.0, 1.0); // Red wireframes
+     
+     
+     // Draw each triangle's edges properly
+     // Each segment creates 2 triangles with 6 vertices total
+     const segments = (fillVerts.length / 6);
+     for (let i = 0; i < segments; i++) {
+       const startVertex = i * 6;
+       
+       // First triangle: vertices 0,1,2
+       gl.drawArrays(gl.LINE_STRIP, startVertex, 3);
+       gl.drawArrays(gl.LINES, startVertex + 2, 1);
+       gl.drawArrays(gl.LINES, startVertex, 1);
+       
+       // Second triangle: vertices 3,4,5  
+       gl.drawArrays(gl.LINE_STRIP, startVertex + 3, 3);
+       gl.drawArrays(gl.LINES, startVertex + 5, 1);
+       gl.drawArrays(gl.LINES, startVertex + 3, 1);
+     }
+   } else {
+     // Draw filled triangles with gradient
+     gl.useProgram(fillProgram);
+     gl.enableVertexAttribArray(fillPosLoc);
+     gl.vertexAttribPointer(fillPosLoc, 2, gl.FLOAT, false, 0, 0);
+ 
+     // set gradient colors (top color and bottom color)
+     gl.uniform3f(fillTopColorLoc, 0.196, 0.024, 0.91);      // #3206e8 top
+     gl.uniform3f(fillBottomColorLoc, 1.0, 1.0, 1.0);       // white bottom
+ 
+     gl.drawArrays(gl.TRIANGLES, 0, fillVerts.length / 2);
+   }
+
+  // 2) Draw line on top
+  const lineVerts = buildLineVertices();
+  gl.bindBuffer(gl.ARRAY_BUFFER, lineBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, lineVerts, gl.STREAM_DRAW);
+
+  gl.useProgram(lineProgram);
+  gl.enableVertexAttribArray(linePosLoc);
+  gl.vertexAttribPointer(linePosLoc, 2, gl.FLOAT, false, 0, 0);
+
+  // set line color (#3206e8)
+  gl.uniform4f(lineColorLoc, 0.196, 0.024, 0.91, 1.0);
+
+  // It's ok if line width stays 1 (many browsers ignore >1)
+  gl.drawArrays(gl.LINE_STRIP, 0, lineVerts.length / 2);
+
+  // 3) Draw "BTC" text using the reusable function
+  renderMSDFText('BTC / USDT Binance', {
+    x: 0,           // Center horizontally
+    y: 0.7,         // Higher up, more visible
+    scale: 1,     // Much larger scale for visibility
+    color: [0.0, 0.0, 0.0, 1.0], // White
+    fontSize: 15
+  });
+  
+  // 4) Draw current value below BTC text using the reusable function
+  if (points.length > 0) {
+    const currentValue = points[points.length - 1].y;
+    const valueText = currentValue.toFixed(3);
+    
+    renderMSDFText(valueText, {
+      x: 0,          // Center horizontally
+      y: 0.5,        // Below BTC text
+      scale: 1,    // Smaller than BTC but still visible
+      color: [0.0, 0.0, 0.0, 1.0], // Slightly dimmer than BTC
+      fontSize: 10
+    });
+  }
+  
+  // Check for WebGL errors
+  const error = gl.getError();
+  if (error !== gl.NO_ERROR) {
+    console.error('WebGL error after drawing text:', error);
+  }
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+ /* ---------- UI controls ---------- */
+ const pauseBtn = document.getElementById('pauseBtn');
+ const showWireframeBtn = document.getElementById('showWireframeBtn');
+ 
+ pauseBtn.addEventListener('click', () => {
+   producing = !producing;
+   pauseBtn.textContent = producing ? 'Pause' : 'Resume';
+ });
+ 
+ showWireframeBtn.addEventListener('click', () => {
+   showWireframes = !showWireframes;
+   showWireframeBtn.textContent = showWireframes ? 'Hide Wireframes' : 'Show Wireframes';
+ });
+
+/* ---------- Optional: stabilize on tab visibility ---------- */
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    // pause producing to save CPU
+    producing = false;
+    pauseBtn.textContent = 'Resume';
+  } else {
+    producing = true;
+    pauseBtn.textContent = 'Pause';
+  }
+});
+</script>
+</body>
+</html>
