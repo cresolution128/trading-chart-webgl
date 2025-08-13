@@ -448,6 +448,66 @@ function pushNewSample(yValue) {
  }
  startProducing();
 
+/* ---------- Triangle Indicator Function ---------- */
+function drawTriangleIndicator(x, y, isIncreasing) {
+  // Use the line program for drawing triangles
+  gl.useProgram(lineProgram);
+  
+  // Create triangle vertices - much smaller size with proper spacing
+  const triangleSize = 0.03;
+  const spacing = 0.005; // Space between triangles
+  
+  if (isIncreasing) {
+    // Blue up triangle (active) - positioned higher
+    gl.uniform4f(lineColorLoc, 0.0, 0.0, 1.0, 1.0); // Blue
+    const upTriangle = new Float32Array([
+      x, y + triangleSize + spacing,                    // top
+      x - triangleSize / 2, y + spacing,                    // bottom-left
+      x + triangleSize / 2, y + spacing                     // bottom-right
+    ]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, lineBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, upTriangle, gl.STREAM_DRAW);
+    gl.enableVertexAttribArray(linePosLoc);
+    gl.vertexAttribPointer(linePosLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    
+    // Black down triangle (inactive) - positioned lower
+    gl.uniform4f(lineColorLoc, 0.0, 0.0, 0.0, 1.0); // Black
+    const downTriangle = new Float32Array([
+      x, y - triangleSize - spacing,                    // bottom
+      x - triangleSize / 2, y - spacing,                    // top-left
+      x + triangleSize / 2, y - spacing                     // top-right
+    ]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, lineBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, downTriangle, gl.STREAM_DRAW);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  } else {
+    // Red down triangle (active) - positioned lower
+    gl.uniform4f(lineColorLoc, 1.0, 0.0, 0.0, 1.0); // Red
+    const downTriangle = new Float32Array([
+      x, y - triangleSize - spacing,                    // bottom
+      x - triangleSize / 2, y - spacing,                    // top-left
+      x + triangleSize / 2, y - spacing                     // top-right
+    ]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, lineBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, downTriangle, gl.STREAM_DRAW);
+    gl.enableVertexAttribArray(linePosLoc);
+    gl.vertexAttribPointer(linePosLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    
+    // Black up triangle (inactive) - positioned higher
+    gl.uniform4f(lineColorLoc, 0.0, 0.0, 0.0, 1.0); // Black
+    const upTriangle = new Float32Array([
+      x, y + triangleSize + spacing,                    // top
+      x - triangleSize / 2, y + spacing,                    // bottom-left
+      x + triangleSize / 2, y + spacing                     // bottom-right
+    ]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, lineBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, upTriangle, gl.STREAM_DRAW);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+}
+
 /* ---------- Render ---------- */
 function render() {
   resizeCanvasToDisplaySize();
@@ -524,6 +584,15 @@ function render() {
   if (points.length > 0) {
     const currentValue = points[points.length - 1].y;
     const valueText = currentValue.toFixed(3);
+    
+    // Draw triangle indicator based on value change
+    if (points.length > 1) {
+      const prevValue = points[points.length - 2].y;
+      const isIncreasing = currentValue > prevValue;
+      
+      // Draw triangle indicator to the left of the value
+      drawTriangleIndicator(-0.15, 0.515, isIncreasing);
+    }
     
     renderMSDFText(valueText, {
       x: 0,          // Center horizontally
