@@ -337,10 +337,7 @@ function renderMSDFText(text, options = {}) {
       
       // Normalize Y position for consistent baseline alignment across all characters
       let charY;
-      if (char === '.') {
-        // For dots, align to the bottom baseline of numbers
-        charY = (glyph.yoffset + glyph.height * 0.5 - baseFontSize) / 100.0;
-      } else if (char === '-') {
+      if (char === '-') {
         // For hyphens, center them vertically with the text baseline
         charY = (glyph.yoffset + glyph.height * 0.5 - baseFontSize * 0.35) / 100.0;
       } else {
